@@ -1,4 +1,6 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
+import { jsPDF } from 'jspdf';
 import {
   Employee,
   FuelDispensary,
@@ -19,8 +21,10 @@ import {
   ChevronUp,
   Clock,
   Copy,
+  DollarSign,
   Download,
   Edit3,
+  FileText,
   Fuel,
   Gauge,
   Layers,
@@ -28,6 +32,7 @@ import {
   MapPin,
   Package,
   Plus,
+  Printer,
   Route,
   Search,
   Table2,
@@ -225,6 +230,17 @@ function vehicleMatchesVoucher(vehicle: Vehicle | undefined, voucher: FuelDispen
   return false;
 }
 
+function resolveVoucherCost(voucher: FuelDispensary | undefined, liters?: number): number {
+  if (!voucher) return 0;
+  const effLiters = liters !== undefined ? liters : Math.abs(Number(voucher.cantCarga ?? voucher.cantidad ?? 0));
+  const raw = Number(voucher.totalImporte || (voucher.precioUnitario ? voucher.precioUnitario * effLiters : 0));
+  return Number.isFinite(raw) ? Math.abs(raw) : 0;
+}
+
+function formatMoney(amount: number): string {
+  return `$${Math.round(amount).toLocaleString('es-AR')}`;
+}
+
 interface DraftTripRow {
   localKey: string;
   id?: string;
@@ -242,6 +258,7 @@ interface DraftTripRow {
   tipoCarga: string;
   detalleCarga: string;
   observaciones: string;
+  markedUnlink?: boolean;
 }
 
 const createEmptyDraftRow = (fechaDefault: string, choferNombreDefault = '', choferIdDefault = ''): DraftTripRow => ({
@@ -290,9 +307,14 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
   // Multi-selection for grouping existing trips
   const [selectedTripIds, setSelectedTripIds] = useState<string[]>([]);
 
-  // Batch / Single Trip Modal
+  // Batch / Single / Group Edit Trip Modal
   const [isTripModalOpen, setIsTripModalOpen] = useState(false);
   const [editingTrip, setEditingTrip] = useState<TruckPerformanceTrip | null>(null);
+  const [editingGroupContext, setEditingGroupContext] = useState<{
+    groupKey: string;
+    title: string;
+    originalTripsById: Map<string, TruckPerformanceTrip>;
+  } | null>(null);
   const [showAllFleetInModal, setShowAllFleetInModal] = useState(false);
   const [selectedVehicleId, setSelectedVehicleId] = useState<string>('');
   const [selectedFuelVoucherId, setSelectedFuelVoucherId] = useState<string>('');
@@ -313,6 +335,20 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
   const [pickerGroupByDate, setPickerGroupByDate] = useState<boolean>(true);
   const [isSavingGroup, setIsSavingGroup] = useState(false);
   const [groupError, setGroupError] = useState<string | null>(null);
+
+  // Print Preview & PDF Export Modal
+  const [printScope, setPrintScope] = useState<null | { type: 'group'; groupKey: string } | { type: 'all' }>(null);
+
+  useEffect(() => {
+    if (printScope) {
+      document.body.classList.add('printing-rendimientos');
+    } else {
+      document.body.classList.remove('printing-rendimientos');
+    }
+    return () => {
+      document.body.classList.remove('printing-rendimientos');
+    };
+  }, [printScope]);
 
   // Delete confirmation modal
   const [tripToDelete, setTripToDelete] = useState<TruckPerformanceTrip | null>(null);
@@ -429,10 +465,13 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
     });
 
     let totalLinkedLiters = 0;
+    let totalLinkedCost = 0;
     uniqueVoucherIds.forEach(vid => {
       const voucher = fuelVouchersById.get(vid);
       if (voucher) {
-        totalLinkedLiters += Math.abs(Number(voucher.cantCarga ?? voucher.cantidad ?? 0));
+        const lit = Math.abs(Number(voucher.cantCarga ?? voucher.cantidad ?? 0));
+        totalLinkedLiters += lit;
+        totalLinkedCost += resolveVoucherCost(voucher, lit);
       } else {
         const snapTrip = filteredTrips.find(t => t.fuelVoucherId === vid && t.fuelLitersSnapshot);
         if (snapTrip?.fuelLitersSnapshot) {
@@ -444,6 +483,9 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
     const avgKmPerLiter = totalLinkedLiters > 0 ? kmsInLinkedTrips / totalLinkedLiters : 0;
     const avgLitersPer100 = kmsInLinkedTrips > 0 && totalLinkedLiters > 0
       ? (totalLinkedLiters / kmsInLinkedTrips) * 100
+      : 0;
+    const avgCostPerKm = kmsInLinkedTrips > 0 && totalLinkedCost > 0
+      ? totalLinkedCost / kmsInLinkedTrips
       : 0;
 
     const timedDurations = filteredTrips
@@ -458,8 +500,10 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
       totalKms,
       linkedLoadsCount: uniqueVoucherIds.size,
       totalLinkedLiters,
+      totalLinkedCost,
       avgKmPerLiter,
       avgLitersPer100,
+      avgCostPerKm,
       timedCount: timedDurations.length,
       totalMinutes,
       avgMinutes,
@@ -688,6 +732,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
           ...s,
           loadsCount: s.linkedVoucherIds.size,
           totalLiters,
+          totalCost,
           kmPerLiter,
           litersPer100,
           avgMins,
@@ -844,6 +889,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
   // Open Batch Create Modal
   const handleOpenBatchModal = (preselectedVoucher?: FuelDispensary) => {
     setEditingTrip(null);
+    setEditingGroupContext(null);
     setModalError(null);
     setFuelVoucherSearch('');
     const today = new Date().toISOString().slice(0, 10);
@@ -879,9 +925,10 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
     setIsTripModalOpen(true);
   };
 
-  // Open Edit Modal for existing trip
+  // Open Edit Modal for existing single trip
   const handleOpenEditModal = (trip: TruckPerformanceTrip) => {
     setEditingTrip(trip);
+    setEditingGroupContext(null);
     setModalError(null);
     setFuelVoucherSearch('');
     const matchedVeh =
@@ -914,6 +961,58 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
         observaciones: trip.observaciones || '',
       },
     ]);
+    setIsTripModalOpen(true);
+  };
+
+  // Open Batch Edit Modal for an entire Fuel Group (edit all trips, reassign fuel load/truck, add/unlink trips)
+  const handleOpenEditGroupModal = (grp: (typeof fuelGroups)[number]) => {
+    setEditingTrip(null);
+    setModalError(null);
+    setFuelVoucherSearch('');
+
+    const firstTrip = grp.trips[0];
+    const matchedVeh =
+      (grp.voucher && allActiveVehicles.find(v => vehicleMatchesVoucher(v, grp.voucher!))) ||
+      (firstTrip && allActiveVehicles.find(v => v.id === firstTrip.vehiculoId || v.modeloMarca === firstTrip.codigoEquipo));
+
+    if (matchedVeh && !truckVehicles.some(tv => tv.id === matchedVeh.id)) {
+      setShowAllFleetInModal(true);
+    } else {
+      setShowAllFleetInModal(false);
+    }
+
+    setSelectedVehicleId(matchedVeh?.id || '');
+    setSelectedFuelVoucherId(grp.fuelVoucherId || '');
+
+    const origMap = new Map<string, TruckPerformanceTrip>();
+    grp.trips.forEach(t => origMap.set(t.id, t));
+    setEditingGroupContext({
+      groupKey: grp.groupKey,
+      title: grp.groupKey === 'UNLINKED' ? 'Viajes Pendientes de Agrupar' : `${grp.codigoEquipo} · ${grp.label}`,
+      originalTripsById: origMap,
+    });
+
+    setDraftRows(
+      grp.trips.map(t => ({
+        localKey: t.id,
+        id: t.id,
+        fecha: t.fecha || new Date().toISOString().slice(0, 10),
+        choferId: t.choferId || '',
+        choferNombre: t.choferNombre || '',
+        lugarInicio: t.lugarInicio || '',
+        lugarFinal: t.lugarFinal || '',
+        horaSalida: t.horaSalida || '',
+        horaLlegada: t.horaLlegada || '',
+        kilometros: String(t.kilometros ?? ''),
+        odometroInicio: t.odometroInicio !== undefined ? String(t.odometroInicio) : '',
+        odometroFin: t.odometroFin !== undefined ? String(t.odometroFin) : '',
+        showOdometerHelper: false,
+        tipoCarga: t.tipoCarga || 'Áridos / Ripio',
+        detalleCarga: t.detalleCarga || '',
+        observaciones: t.observaciones || '',
+        markedUnlink: false,
+      }))
+    );
     setIsTripModalOpen(true);
   };
 
@@ -958,30 +1057,33 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
   };
 
   const batchPreviewStats = useMemo(() => {
-    const validKms = draftRows.reduce((s, r) => s + (Number(r.kilometros) > 0 ? Number(r.kilometros) : 0), 0);
-    const mins = draftRows.reduce((s, r) => {
+    const activeRows = draftRows.filter(r => !r.markedUnlink);
+    const validKms = activeRows.reduce((s, r) => s + (Number(r.kilometros) > 0 ? Number(r.kilometros) : 0), 0);
+    const mins = activeRows.reduce((s, r) => {
       const d = computeDurationMinutes(r.horaSalida, r.horaLlegada);
       return s + (d !== null ? d : 0);
     }, 0);
-    const timedRows = draftRows.filter(r => computeDurationMinutes(r.horaSalida, r.horaLlegada) !== null).length;
+    const timedRows = activeRows.filter(r => computeDurationMinutes(r.horaSalida, r.horaLlegada) !== null).length;
     const liters = selectedFuelVoucherObj
       ? Math.abs(Number(selectedFuelVoucherObj.cantCarga ?? selectedFuelVoucherObj.cantidad ?? 0))
       : 0;
+    const totalCost = resolveVoucherCost(selectedFuelVoucherObj, liters);
     const autonomy = liters > 0 && validKms > 0 ? validKms / liters : null;
-    return { validKms, mins, timedRows, liters, autonomy };
+    return { activeCount: activeRows.length, validKms, mins, timedRows, liters, totalCost, autonomy };
   }, [draftRows, selectedFuelVoucherObj]);
 
   const handleSaveBatchSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setModalError(null);
 
-    if (!modalSelectedVehicle && !editingTrip) {
+    if (!modalSelectedVehicle && !editingTrip && !editingGroupContext) {
       setModalError('Seleccioná el camión para registrar los viajes.');
       return;
     }
 
     for (let i = 0; i < draftRows.length; i++) {
       const r = draftRows[i];
+      if (r.markedUnlink) continue;
       if (!r.lugarInicio.trim() || !r.lugarFinal.trim()) {
         setModalError(`Viaje #${i + 1}: completá el Lugar de Inicio y el Lugar de Final.`);
         return;
@@ -1000,20 +1102,24 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
       : undefined;
 
     const payload: TruckPerformanceTrip[] = draftRows.map((r, idx) => {
+      const origTrip = r.id
+        ? editingTrip || editingGroupContext?.originalTripsById.get(r.id)
+        : undefined;
       const dur = computeDurationMinutes(r.horaSalida, r.horaLlegada);
       const matchedObra = obras.find(
         o =>
           o.nombreObra.toLowerCase() === r.lugarFinal.trim().toLowerCase() ||
           o.nombreObra.toLowerCase() === r.lugarInicio.trim().toLowerCase()
       );
+      const unlinkThis = Boolean(r.markedUnlink);
       return {
         id: r.id || `REND-${Date.now()}-${idx}-${Math.random().toString(36).slice(2, 6)}`,
         categoriaEquipo: 'CAMIONES',
         fecha: r.fecha || new Date().toISOString().slice(0, 10),
-        vehiculoId: modalSelectedVehicle?.id || editingTrip?.vehiculoId,
-        codigoEquipo: modalSelectedVehicle?.modeloMarca || editingTrip?.codigoEquipo || '',
-        marcaModelo: modalSelectedVehicle?.modeloMarca || editingTrip?.marcaModelo,
-        patente: modalSelectedVehicle?.patente || editingTrip?.patente || '',
+        vehiculoId: modalSelectedVehicle?.id || origTrip?.vehiculoId,
+        codigoEquipo: modalSelectedVehicle?.modeloMarca || origTrip?.codigoEquipo || '',
+        marcaModelo: modalSelectedVehicle?.modeloMarca || origTrip?.marcaModelo,
+        patente: modalSelectedVehicle?.patente || origTrip?.patente || '',
         choferId: r.choferId || undefined,
         choferNombre: r.choferNombre.trim() || 'Sin chofer asignado',
         obraId: matchedObra?.id,
@@ -1029,11 +1135,11 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
         tipoCarga: r.tipoCarga.trim() || 'Otro',
         detalleCarga: r.detalleCarga.trim() || undefined,
         observaciones: r.observaciones.trim() || undefined,
-        fuelVoucherId: fuelVoucher ? fuelVoucher.id : undefined,
-        fuelVoucherLabel: fuelVoucher ? formatFuelVoucherLabel(fuelVoucher, fleet) : undefined,
-        fuelLitersSnapshot: fuelLiters,
-        fuelFechaSnapshot: fuelVoucher?.fecha,
-        createdAt: editingTrip?.createdAt || nowIso,
+        fuelVoucherId: !unlinkThis && fuelVoucher ? fuelVoucher.id : undefined,
+        fuelVoucherLabel: !unlinkThis && fuelVoucher ? formatFuelVoucherLabel(fuelVoucher, fleet) : undefined,
+        fuelLitersSnapshot: !unlinkThis ? fuelLiters : undefined,
+        fuelFechaSnapshot: !unlinkThis ? fuelVoucher?.fecha : undefined,
+        createdAt: origTrip?.createdAt || nowIso,
         updatedAt: nowIso,
       };
     });
@@ -1045,6 +1151,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
         setModalError('No se pudo confirmar el guardado en la base de datos. Reintentá.');
         return;
       }
+      setEditingGroupContext(null);
       setIsTripModalOpen(false);
     } catch (err: any) {
       setModalError(err?.message || 'Error guardando viajes en Supabase.');
@@ -1246,6 +1353,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
       'Duración (min)',
       'Kms',
       'Combustible Consumido (L)',
+      'Costo Combustible ($)',
       'Tipo de Carga',
       'Detalle Carga',
       'Carga Combustible Vinculada',
@@ -1267,6 +1375,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
         dur !== null ? String(dur) : '',
         String(t.kilometros || 0),
         cons ? cons.liters.toFixed(2) : '',
+        cons && cons.cost !== null ? cons.cost.toFixed(0) : '',
         t.tipoCarga,
         t.detalleCarga || '',
         t.fuelVoucherLabel || '',
@@ -1282,6 +1391,252 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
     a.download = `rendimientos_camiones_${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     URL.revokeObjectURL(url);
+  };
+
+  const printReportData = useMemo(() => {
+    if (!printScope) return null;
+    const groups =
+      printScope.type === 'group'
+        ? fuelGroups.filter(g => g.groupKey === printScope.groupKey)
+        : fuelGroups;
+    const tripsList = groups.flatMap(g => g.trips);
+    const totalTripsCount = tripsList.length;
+    const totalKms = groups.reduce((s, g) => s + g.totalKms, 0);
+    const totalLiters = groups.reduce((s, g) => s + (g.fuelVoucherId ? g.liters : 0), 0);
+    const totalMoney = groups.reduce((s, g) => s + (g.fuelVoucherId ? g.totalImporte : 0), 0);
+    const totalMins = groups.reduce((s, g) => s + g.totalMinutes, 0);
+    const timedCount = groups.reduce((s, g) => s + g.timedCount, 0);
+    const linkedKms = groups.reduce((s, g) => s + (g.fuelVoucherId ? g.totalKms : 0), 0);
+    const autonomyKmL = totalLiters > 0 && linkedKms > 0 ? linkedKms / totalLiters : null;
+    const litersPer100 = totalLiters > 0 && linkedKms > 0 ? (totalLiters / linkedKms) * 100 : null;
+    const costPerKm = totalMoney > 0 && linkedKms > 0 ? totalMoney / linkedKms : null;
+
+    const singleGroup = printScope.type === 'group' ? groups[0] : undefined;
+    const title = singleGroup
+      ? singleGroup.groupKey === 'UNLINKED'
+        ? 'REPORTE DE VIAJES PENDIENTES DE AGRUPAR'
+        : `REPORTE DE RENDIMIENTO · ${singleGroup.codigoEquipo}`
+      : 'REPORTE GENERAL DE RENDIMIENTOS DE CAMIONES';
+
+    const subtitle = singleGroup
+      ? singleGroup.label
+      : `${groups.length} grupo(s) · ${
+          truckFilter !== 'ALL' ? `Camión: ${truckFilter}` : 'Toda la flota'
+        }${dateFrom || dateTo ? ` · Período: ${dateFrom || '...'} al ${dateTo || '...'}` : ''}`;
+
+    return {
+      title,
+      subtitle,
+      singleGroup,
+      groups,
+      totalTripsCount,
+      totalKms,
+      totalLiters,
+      totalMoney,
+      totalMins,
+      timedCount,
+      autonomyKmL,
+      litersPer100,
+      costPerKm,
+    };
+  }, [printScope, fuelGroups, truckFilter, dateFrom, dateTo]);
+
+  const handleDownloadPdfReport = () => {
+    if (!printReportData) return;
+    const pdf = new jsPDF({ orientation: 'landscape', unit: 'mm', format: 'a4' });
+    const pageW = pdf.internal.pageSize.getWidth();
+    const pageH = pdf.internal.pageSize.getHeight();
+    const margin = 12;
+    const contentW = pageW - margin * 2;
+    let y = 12;
+
+    const drawHeader = () => {
+      pdf.setFillColor(22, 25, 31);
+      pdf.rect(margin, y, contentW, 18, 'F');
+      pdf.setFillColor(240, 200, 0);
+      pdf.rect(margin, y, 3, 18, 'F');
+
+      pdf.setTextColor(240, 200, 0);
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(11);
+      pdf.text('LA HORMIGA · CONTROL OPERATIVO DE FLOTA', margin + 6, y + 6.5);
+
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(10);
+      pdf.text(printReportData.title, margin + 6, y + 12.2);
+
+      pdf.setTextColor(180, 190, 205);
+      pdf.setFont('helvetica', 'normal');
+      pdf.setFontSize(8);
+      pdf.text(printReportData.subtitle.slice(0, 125), margin + 6, y + 16.2);
+
+      pdf.setTextColor(210, 215, 225);
+      pdf.text(`Emisión: ${new Date().toLocaleDateString('es-AR')}`, pageW - margin - 4, y + 7, { align: 'right' });
+      y += 22;
+    };
+
+    drawHeader();
+
+    // 6-box KPI bar
+    const kpiBoxes = [
+      { label: 'VIAJES', value: String(printReportData.totalTripsCount) },
+      { label: 'KMS TOTALES', value: `${printReportData.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km` },
+      { label: 'COMBUSTIBLE', value: printReportData.totalLiters > 0 ? `${printReportData.totalLiters.toLocaleString('es-AR', { maximumFractionDigits: 1 })} L` : '—' },
+      { label: 'TOTAL EN PLATA', value: printReportData.totalMoney > 0 ? formatMoney(printReportData.totalMoney) : '—' },
+      { label: 'AUTONOMÍA', value: printReportData.autonomyKmL ? `${printReportData.autonomyKmL.toFixed(2)} km/L` : '—' },
+      { label: 'COSTO / KM', value: printReportData.costPerKm ? `$${printReportData.costPerKm.toFixed(0)}/km` : formatDurationMinutes(printReportData.totalMins) },
+    ];
+    const boxW = (contentW - 10) / kpiBoxes.length;
+    kpiBoxes.forEach((box, i) => {
+      const bx = margin + i * (boxW + 2);
+      pdf.setFillColor(248, 250, 252);
+      pdf.setDrawColor(203, 213, 225);
+      pdf.rect(bx, y, boxW, 13, 'FD');
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(6.5);
+      pdf.setTextColor(100, 116, 139);
+      pdf.text(box.label, bx + 2.5, y + 4.5);
+      pdf.setFontSize(9.5);
+      pdf.setTextColor(15, 23, 42);
+      pdf.text(box.value, bx + 2.5, y + 10.2);
+    });
+    y += 17;
+
+    const colWidths = [22, 46, 68, 32, 28, 22, 22, 33]; // sum = 273mm (297 - 24 = 273)
+    const headers = ['Fecha', 'Camión / Chofer', 'Recorrido (Inicio -> Final)', 'Carga', 'Horario / Demora', 'Kms', 'Comb. (L)', 'Importe ($)'];
+
+    const drawTableHeader = () => {
+      pdf.setFillColor(30, 41, 59);
+      pdf.rect(margin, y, contentW, 7.5, 'F');
+      pdf.setTextColor(255, 255, 255);
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(7.5);
+      let cx = margin + 2;
+      headers.forEach((h, i) => {
+        if (i >= 5) {
+          pdf.text(h, cx + colWidths[i] - 4, y + 5, { align: 'right' });
+        } else {
+          pdf.text(h, cx, y + 5);
+        }
+        cx += colWidths[i];
+      });
+      y += 7.5;
+    };
+
+    printReportData.groups.forEach((grp, gIdx) => {
+      if (y > pageH - 35) {
+        pdf.addPage();
+        y = 12;
+        drawHeader();
+      }
+
+      if (printReportData.groups.length > 1 || gIdx === 0) {
+        pdf.setFillColor(254, 249, 217);
+        pdf.setDrawColor(221, 168, 0);
+        pdf.rect(margin, y, contentW, 7, 'FD');
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(8);
+        pdf.setTextColor(15, 23, 42);
+        const grpTitle = grp.groupKey === 'UNLINKED'
+          ? 'Viajes Pendientes de Agrupar'
+          : `${grp.codigoEquipo}${grp.patente ? ` (${grp.patente})` : ''} · ${grp.label}`;
+        pdf.text(grpTitle.slice(0, 95), margin + 2.5, y + 4.8);
+
+        const grpRight = `${grp.trips.length} viajes · ${grp.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km${
+          grp.liters > 0 ? ` · ${grp.liters.toLocaleString('es-AR', { maximumFractionDigits: 1 })} L` : ''
+        }${grp.totalImporte > 0 ? ` · ${formatMoney(grp.totalImporte)}` : ''}`;
+        pdf.text(grpRight, pageW - margin - 2.5, y + 4.8, { align: 'right' });
+        y += 7.5;
+      }
+
+      drawTableHeader();
+
+      grp.trips.forEach((t, idx) => {
+        if (y > pageH - 22) {
+          pdf.addPage();
+          y = 12;
+          drawHeader();
+          drawTableHeader();
+        }
+        if (idx % 2 === 1) {
+          pdf.setFillColor(248, 250, 252);
+          pdf.rect(margin, y, contentW, 7, 'F');
+        }
+        const dur = typeof t.duracionMinutos === 'number'
+          ? t.duracionMinutos
+          : computeDurationMinutes(t.horaSalida, t.horaLlegada);
+        const cons = tripFuelConsumptionMap.get(t.id);
+
+        pdf.setFont('helvetica', 'normal');
+        pdf.setFontSize(7.2);
+        pdf.setTextColor(15, 23, 42);
+
+        const rowCells = [
+          formatTableCellDate(t.fecha),
+          `${t.codigoEquipo} / ${t.choferNombre || '-'}`.slice(0, 29),
+          `${t.lugarInicio} -> ${t.lugarFinal}`.slice(0, 44),
+          (t.tipoCarga || '-').slice(0, 20),
+          t.horaSalida || t.horaLlegada
+            ? `${t.horaSalida || '--'}->${t.horaLlegada || '--'}${dur !== null ? ` (${formatDurationMinutes(dur)})` : ''}`
+            : 'Sin hora',
+          `${Number(t.kilometros || 0).toLocaleString('es-AR', { maximumFractionDigits: 1 })} km`,
+          cons ? `${cons.liters.toLocaleString('es-AR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })} L` : '—',
+          cons && cons.cost !== null ? formatMoney(cons.cost) : '—',
+        ];
+
+        let cx = margin + 2;
+        rowCells.forEach((txt, i) => {
+          if (i >= 5) {
+            if (i === 7 && cons && cons.cost !== null) pdf.setFont('helvetica', 'bold');
+            pdf.text(txt, cx + colWidths[i] - 4, y + 4.8, { align: 'right' });
+            pdf.setFont('helvetica', 'normal');
+          } else {
+            pdf.text(txt, cx, y + 4.8);
+          }
+          cx += colWidths[i];
+        });
+        pdf.setDrawColor(226, 232, 240);
+        pdf.line(margin, y + 7, pageW - margin, y + 7);
+        y += 7;
+      });
+
+      // Group subtotal row
+      pdf.setFillColor(241, 245, 249);
+      pdf.rect(margin, y, contentW, 7.5, 'F');
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(7.8);
+      pdf.setTextColor(15, 23, 42);
+      pdf.text(`TOTAL GRUPO (${grp.trips.length} viajes)`, margin + 2.5, y + 5.1);
+
+      let cx = margin + 2;
+      colWidths.slice(0, 5).forEach(w => { cx += w; });
+      pdf.text(`${grp.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km`, cx + colWidths[5] - 4, y + 5.1, { align: 'right' });
+      cx += colWidths[5];
+      pdf.text(grp.liters > 0 ? `${grp.liters.toLocaleString('es-AR', { minimumFractionDigits: 1, maximumFractionDigits: 1 })} L` : '—', cx + colWidths[6] - 4, y + 5.1, { align: 'right' });
+      cx += colWidths[6];
+      pdf.text(grp.totalImporte > 0 ? formatMoney(grp.totalImporte) : '—', cx + colWidths[7] - 4, y + 5.1, { align: 'right' });
+      y += 10.5;
+    });
+
+    const pageCount = pdf.getNumberOfPages();
+    for (let p = 1; p <= pageCount; p++) {
+      pdf.setPage(p);
+      pdf.setFont('helvetica', 'normal');
+      pdf.setFontSize(7);
+      pdf.setTextColor(100, 116, 139);
+      pdf.text(
+        `La Hormiga Gestión Operativa · Rendimientos de Flota · Página ${p} de ${pageCount}`,
+        pageW / 2,
+        pageH - 6,
+        { align: 'center' }
+      );
+    }
+
+    const fileSlug = printReportData.singleGroup?.voucher?.numOrden
+      ? `orden_${printReportData.singleGroup.voucher.numOrden}`
+      : new Date().toISOString().slice(0, 10);
+    pdf.save(`rendimientos_camiones_${fileSlug}.pdf`);
   };
 
   const toggleAllVisibleTrips = () => {
@@ -1345,6 +1700,15 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
             <>
               <button
                 type="button"
+                onClick={() => setPrintScope({ type: 'all' })}
+                disabled={filteredTrips.length === 0}
+                className="px-3.5 py-2 rounded-lg text-xs font-semibold bg-[#0F1115] hover:bg-slate-800 text-slate-200 border border-slate-800 transition whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
+              >
+                <Printer className="w-3.5 h-3.5 text-[#F0C800]" />
+                Imprimir / PDF
+              </button>
+              <button
+                type="button"
                 onClick={handleExportCsv}
                 disabled={filteredTrips.length === 0}
                 className="px-3.5 py-2 rounded-lg text-xs font-semibold bg-[#0F1115] hover:bg-slate-800 text-slate-200 border border-slate-800 transition whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer disabled:opacity-40"
@@ -1386,8 +1750,8 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
         </div>
       ) : (
         <>
-          {/* 4-Column KPI Strip */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          {/* 5-Column KPI Strip (including Inversión en Plata) */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
             <div className="bg-[#16191F] border border-slate-800 rounded-xl p-4 space-y-1">
               <div className="text-xs text-slate-400 flex items-center justify-between">
                 <span>Viajes Registrados</span>
@@ -1397,7 +1761,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                 {kpis.totalTrips.toLocaleString('es-AR')}
               </div>
               <div className="text-[11px] text-slate-400 font-mono tabular-nums">
-                {kpis.linkedLoadsCount} cargas de combustible vinculadas
+                {kpis.linkedLoadsCount} cargas vinculadas
               </div>
             </div>
 
@@ -1411,7 +1775,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
               </div>
               <div className="text-[11px] text-slate-400 font-mono tabular-nums">
                 {kpis.totalTrips > 0
-                  ? `${(kpis.totalKms / kpis.totalTrips).toFixed(1)} km promedio / viaje`
+                  ? `${(kpis.totalKms / kpis.totalTrips).toFixed(1)} km prom. / viaje`
                   : 'Sin viajes en el filtro'}
               </div>
             </div>
@@ -1427,13 +1791,28 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
               <div className="text-[11px] text-slate-400 font-mono tabular-nums">
                 {kpis.avgLitersPer100 > 0
                   ? `${kpis.avgLitersPer100.toFixed(1)} L/100km · ${kpis.totalLinkedLiters.toLocaleString('es-AR', { maximumFractionDigits: 1 })} L`
-                  : 'Agrupá viajes con una carga para calcular'}
+                  : 'Agrupá viajes con una carga'}
               </div>
             </div>
 
             <div className="bg-[#16191F] border border-slate-800 rounded-xl p-4 space-y-1">
               <div className="text-xs text-slate-400 flex items-center justify-between">
-                <span>Demora Promedio por Viaje</span>
+                <span>Total en Combustible ($)</span>
+                <DollarSign className="w-4 h-4 text-emerald-400" />
+              </div>
+              <div className="text-2xl font-bold text-white font-mono tabular-nums">
+                {kpis.totalLinkedCost > 0 ? formatMoney(kpis.totalLinkedCost) : '—'}
+              </div>
+              <div className="text-[11px] text-slate-400 font-mono tabular-nums">
+                {kpis.avgCostPerKm > 0
+                  ? `${formatMoney(kpis.avgCostPerKm)} / km promedio`
+                  : 'Según importe de las cargas'}
+              </div>
+            </div>
+
+            <div className="bg-[#16191F] border border-slate-800 rounded-xl p-4 space-y-1">
+              <div className="text-xs text-slate-400 flex items-center justify-between">
+                <span>Demora Promedio</span>
                 <Clock className="w-4 h-4 text-emerald-400" />
               </div>
               <div className="text-2xl font-bold text-emerald-400 font-mono tabular-nums">
@@ -1441,8 +1820,8 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
               </div>
               <div className="text-[11px] text-slate-400 font-mono tabular-nums">
                 {kpis.timedCount > 0
-                  ? `${kpis.timedCount} de ${kpis.totalTrips} viajes con hora · Total ${formatDurationMinutes(kpis.totalMinutes)}`
-                  : 'Opcional: cargá salida/llegada para medir'}
+                  ? `${kpis.timedCount} con hora · Total ${formatDurationMinutes(kpis.totalMinutes)}`
+                  : 'Opcional: cargá salida/llegada'}
               </div>
             </div>
           </div>
@@ -1711,6 +2090,12 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                                 </div>
                               </div>
                               <div>
+                                <div className="text-[10px] text-slate-400 font-sans">Total Carga ($)</div>
+                                <div className="font-bold text-emerald-400">
+                                  {grp.totalImporte > 0 ? formatMoney(grp.totalImporte) : '—'}
+                                </div>
+                              </div>
+                              <div>
                                 <div className="text-[10px] text-slate-400 font-sans">Autonomía</div>
                                 <div className="font-bold text-emerald-400">
                                   {grp.kmPerLiter !== null ? `${grp.kmPerLiter.toFixed(2)} km/L` : '—'}
@@ -1722,6 +2107,14 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                                   {grp.litersPer100Km !== null ? `${grp.litersPer100Km.toFixed(1)} L/100` : '—'}
                                 </div>
                               </div>
+                              {grp.costPerKm !== null && (
+                                <div>
+                                  <div className="text-[10px] text-slate-400 font-sans">Costo / km</div>
+                                  <div className="font-bold text-slate-200">
+                                    ${grp.costPerKm.toFixed(0)}/km
+                                  </div>
+                                </div>
+                              )}
                             </>
                           )}
                           <div>
@@ -1738,7 +2131,25 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                           )}
                         </div>
 
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setPrintScope({ type: 'group', groupKey: grp.groupKey })}
+                            className="px-2.5 py-1.5 rounded-lg bg-[#0F1115] hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs font-semibold whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                            title="Vista previa e impresión de este grupo"
+                          >
+                            <Printer className="w-3.5 h-3.5 text-[#F0C800]" />
+                            Imprimir
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleOpenEditGroupModal(grp)}
+                            className="px-2.5 py-1.5 rounded-lg bg-[#0F1115] hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs font-semibold whitespace-nowrap shrink-0 flex items-center gap-1.5 cursor-pointer"
+                            title="Editar todos los viajes de este grupo o reasignar la carga"
+                          >
+                            <Edit3 className="w-3.5 h-3.5 text-emerald-400" />
+                            Editar Grupo
+                          </button>
                           {isUnlinked ? (
                             <button
                               type="button"
@@ -1911,28 +2322,44 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                               );
                             })}
                           </tbody>
-                          {!isUnlinked && grp.liters > 0 && (
-                            <tfoot>
-                              <tr className="bg-[#0F1115]/90 border-t border-slate-800 text-xs font-mono tabular-nums">
-                                <td colSpan={5} className="py-2.5 px-4 font-sans text-slate-400 font-semibold">
-                                  Total consumido en {grp.trips.length} {grp.trips.length === 1 ? 'viaje' : 'viajes'} de la carga
-                                </td>
-                                <td className="py-2.5 px-3 text-right font-bold text-white whitespace-nowrap">
-                                  {grp.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km
-                                </td>
-                                <td className="py-2.5 px-3 text-right font-bold text-[#F0C800] whitespace-nowrap">
-                                  {grp.trips
-                                    .reduce((sum, tr) => sum + (tripFuelConsumptionMap.get(tr.id)?.liters || 0), 0)
-                                    .toLocaleString('es-AR', {
-                                      minimumFractionDigits: 1,
-                                      maximumFractionDigits: 1,
-                                    })}{' '}
-                                  L
-                                </td>
-                                <td className="py-2.5 px-4"></td>
-                              </tr>
-                            </tfoot>
-                          )}
+                          {!isUnlinked && grp.liters > 0 && (() => {
+                            const grpConsumedLiters = grp.trips.reduce(
+                              (sum, tr) => sum + (tripFuelConsumptionMap.get(tr.id)?.liters || 0),
+                              0
+                            );
+                            const grpConsumedCost = grp.trips.reduce(
+                              (sum, tr) => sum + (tripFuelConsumptionMap.get(tr.id)?.cost || 0),
+                              0
+                            );
+                            const displayCost = grpConsumedCost > 0 ? grpConsumedCost : grp.totalImporte;
+                            return (
+                              <tfoot>
+                                <tr className="bg-[#0F1115]/90 border-t border-slate-800 text-xs font-mono tabular-nums">
+                                  <td colSpan={5} className="py-2.5 px-4 font-sans text-slate-300 font-semibold">
+                                    Total consumido en {grp.trips.length} {grp.trips.length === 1 ? 'viaje' : 'viajes'} de la carga
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-bold text-white whitespace-nowrap">
+                                    {grp.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right whitespace-nowrap">
+                                    <div className="font-bold text-[#F0C800]">
+                                      {grpConsumedLiters.toLocaleString('es-AR', {
+                                        minimumFractionDigits: 1,
+                                        maximumFractionDigits: 1,
+                                      })}{' '}
+                                      L
+                                    </div>
+                                    {displayCost > 0 && (
+                                      <div className="text-xs font-bold text-emerald-400">
+                                        {formatMoney(displayCost)}
+                                      </div>
+                                    )}
+                                  </td>
+                                  <td className="py-2.5 px-4"></td>
+                                </tr>
+                              </tfoot>
+                            );
+                          })()}
                         </table>
                       </div>
                     )}
@@ -2088,6 +2515,58 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                       );
                     })}
                   </tbody>
+                  {filteredTrips.length > 0 && (() => {
+                    const totalFilteredKms = filteredTrips.reduce(
+                      (s, tr) => s + Number(tr.kilometros || 0),
+                      0
+                    );
+                    const totalFilteredLiters = filteredTrips.reduce(
+                      (s, tr) => s + (tripFuelConsumptionMap.get(tr.id)?.liters || 0),
+                      0
+                    );
+                    const totalFilteredCost = filteredTrips.reduce(
+                      (s, tr) => s + (tripFuelConsumptionMap.get(tr.id)?.cost || 0),
+                      0
+                    );
+                    return (
+                      <tfoot>
+                        <tr className="bg-[#0F1115] border-t border-slate-700 text-xs font-mono tabular-nums">
+                          <td colSpan={6} className="py-3 px-4 font-sans text-slate-200 font-bold">
+                            Total del listado ({filteredTrips.length}{' '}
+                            {filteredTrips.length === 1 ? 'viaje' : 'viajes'})
+                          </td>
+                          <td className="py-3 px-3 text-right font-bold text-white whitespace-nowrap">
+                            {totalFilteredKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km
+                          </td>
+                          <td className="py-3 px-3 text-right whitespace-nowrap">
+                            {totalFilteredLiters > 0 ? (
+                              <div>
+                                <div className="font-bold text-[#F0C800]">
+                                  {totalFilteredLiters.toLocaleString('es-AR', {
+                                    minimumFractionDigits: 1,
+                                    maximumFractionDigits: 1,
+                                  })}{' '}
+                                  L
+                                </div>
+                                {totalFilteredCost > 0 && (
+                                  <div className="text-xs font-bold text-emerald-400">
+                                    {formatMoney(totalFilteredCost)}
+                                  </div>
+                                )}
+                              </div>
+                            ) : (
+                              <span className="text-slate-500">—</span>
+                            )}
+                          </td>
+                          <td colSpan={2} className="py-3 px-4 text-right font-sans text-[11px] text-slate-400">
+                            {totalFilteredCost > 0 && totalFilteredKms > 0
+                              ? `Promedio: $${(totalFilteredCost / totalFilteredKms).toFixed(0)}/km`
+                              : ''}
+                          </td>
+                        </tr>
+                      </tfoot>
+                    );
+                  })()}
                 </table>
               </div>
             </div>
@@ -2106,6 +2585,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                       <th className="py-3 px-3 text-right">Autonomía (km/L)</th>
                       <th className="py-3 px-3 text-right">Consumo (L/100km)</th>
                       <th className="py-3 px-3 text-right">Demora Prom. / Viaje</th>
+                      <th className="py-3 px-3 text-right">Inversión Comb. ($)</th>
                       <th className="py-3 px-4 text-right">Costo Comb. / km</th>
                     </tr>
                   </thead>
@@ -2137,12 +2617,54 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                         <td className="py-3 px-3 text-right font-mono tabular-nums text-emerald-400">
                           {formatDurationMinutes(s.avgMins)}
                         </td>
+                        <td className="py-3 px-3 text-right font-mono tabular-nums font-bold text-emerald-400">
+                          {s.totalCost > 0 ? formatMoney(s.totalCost) : '—'}
+                        </td>
                         <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-200">
                           {s.costPerKm !== null ? `$${s.costPerKm.toFixed(2)}` : '—'}
                         </td>
                       </tr>
                     ))}
                   </tbody>
+                  {truckSummaries.length > 0 && (
+                    <tfoot>
+                      <tr className="bg-[#0F1115] border-t border-slate-700 text-xs font-mono tabular-nums">
+                        <td className="py-3 px-4 font-sans font-bold text-slate-200">
+                          Total Flota ({truckSummaries.length}{' '}
+                          {truckSummaries.length === 1 ? 'camión' : 'camiones'})
+                        </td>
+                        <td className="py-3 px-3 text-right font-bold text-white">
+                          {kpis.totalTrips}
+                        </td>
+                        <td className="py-3 px-3 text-right font-bold text-white">
+                          {kpis.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km
+                        </td>
+                        <td className="py-3 px-3 text-right font-bold text-slate-300">
+                          {kpis.linkedLoadsCount}
+                        </td>
+                        <td className="py-3 px-3 text-right font-bold text-slate-200">
+                          {kpis.totalLinkedLiters > 0
+                            ? `${kpis.totalLinkedLiters.toLocaleString('es-AR', { maximumFractionDigits: 1 })} L`
+                            : '—'}
+                        </td>
+                        <td className="py-3 px-3 text-right font-bold text-[#F0C800]">
+                          {kpis.avgKmPerLiter > 0 ? `${kpis.avgKmPerLiter.toFixed(2)} km/L` : '—'}
+                        </td>
+                        <td className="py-3 px-3 text-right font-bold text-slate-200">
+                          {kpis.avgLitersPer100 > 0 ? `${kpis.avgLitersPer100.toFixed(1)} L` : '—'}
+                        </td>
+                        <td className="py-3 px-3 text-right font-bold text-emerald-400">
+                          {formatDurationMinutes(kpis.avgMinutes)}
+                        </td>
+                        <td className="py-3 px-3 text-right font-bold text-emerald-400">
+                          {kpis.totalLinkedCost > 0 ? formatMoney(kpis.totalLinkedCost) : '—'}
+                        </td>
+                        <td className="py-3 px-4 text-right font-bold text-slate-200">
+                          {kpis.avgCostPerKm > 0 ? `$${kpis.avgCostPerKm.toFixed(2)}` : '—'}
+                        </td>
+                      </tr>
+                    </tfoot>
+                  )}
                 </table>
               </div>
             </div>
@@ -2161,10 +2683,14 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                   <h3 className="text-base font-bold text-white">
                     {editingTrip
                       ? 'Editar Viaje de Rendimiento'
-                      : 'Cargar Viajes de Camión y Agrupar en Carga de Combustible'}
+                      : editingGroupContext
+                        ? `Editar Grupo de Viajes (${draftRows.length})`
+                        : 'Cargar Viajes de Camión y Agrupar en Carga de Combustible'}
                   </h3>
                   <p className="text-xs text-slate-400">
-                    Podés cargar 1 o varios viajes juntos y vincularlos con una carga del módulo Combustible (la hora es opcional).
+                    {editingGroupContext
+                      ? `Editando grupo: ${editingGroupContext.title}. Podés editar todos los viajes juntos, cambiar la carga o camión, sumar viajes nuevos o desvincular filas.`
+                      : 'Podés cargar 1 o varios viajes juntos y vincularlos con una carga del módulo Combustible (la hora es opcional).'}
                   </p>
                 </div>
               </div>
@@ -2255,7 +2781,8 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
               <div className="space-y-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="text-xs font-bold text-white">
-                    3. Detalle de Viajes ({draftRows.length}) — Horas de salida y llegada son opcionales
+                    3. Detalle de Viajes ({batchPreviewStats.activeCount}
+                    {draftRows.some(r => r.markedUnlink) ? ' activos' : ''}) — Horas de salida y llegada son opcionales
                   </div>
                   {!editingTrip && (
                     <div className="flex items-center gap-2">
@@ -2290,40 +2817,84 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                     const rowDur = computeDurationMinutes(row.horaSalida, row.horaLlegada);
                     const rowKms = Number(row.kilometros);
                     const rowSpeed = rowDur && rowDur > 0 && rowKms > 0 ? rowKms / (rowDur / 60) : null;
+                    const isUnlinkedRow = Boolean(row.markedUnlink);
                     return (
                       <div
                         key={row.localKey}
-                        className="bg-[#0F1115] border border-slate-800 rounded-xl p-4 space-y-3"
+                        className={`bg-[#0F1115] border rounded-xl p-4 space-y-3 transition-opacity ${
+                          isUnlinkedRow
+                            ? 'border-amber-500/40 opacity-55'
+                            : 'border-slate-800'
+                        }`}
                       >
-                        <div className="flex items-center justify-between border-b border-slate-800/70 pb-2">
-                          <div className="flex items-center gap-2 text-xs font-bold text-white">
+                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/70 pb-2">
+                          <div className="flex flex-wrap items-center gap-2 text-xs font-bold text-white">
                             <span>Viaje #{idx + 1}</span>
-                            {rowDur !== null && (
-                              <span className="text-[11px] font-mono font-normal text-emerald-400">
-                                · Duración: {formatDurationMinutes(rowDur)}
-                                {rowSpeed !== null ? ` (${rowSpeed.toFixed(1)} km/h)` : ''}
+                            {isUnlinkedRow ? (
+                              <span className="text-[11px] font-semibold text-amber-300">
+                                · Se desvinculará de esta carga al guardar
                               </span>
+                            ) : (
+                              rowDur !== null && (
+                                <span className="text-[11px] font-mono font-normal text-emerald-400">
+                                  · Duración: {formatDurationMinutes(rowDur)}
+                                  {rowSpeed !== null ? ` (${rowSpeed.toFixed(1)} km/h)` : ''}
+                                </span>
+                              )
                             )}
                           </div>
                           {!editingTrip && (
                             <div className="flex items-center gap-1.5">
-                              <button
-                                type="button"
-                                onClick={() => handleAddDraftRow(row, true)}
-                                className="px-2 py-1 rounded text-[11px] text-amber-300 hover:bg-slate-800 cursor-pointer"
-                                title="Generar viaje de vuelta invirtiendo inicio y final"
-                              >
-                                + Vuelta
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleRemoveDraftRow(row.localKey)}
-                                disabled={draftRows.length <= 1}
-                                className="p-1 text-red-400 hover:bg-red-500/10 rounded disabled:opacity-30 cursor-pointer"
-                                title="Quitar viaje"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+                              {!isUnlinkedRow && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleAddDraftRow(row, true)}
+                                  className="px-2 py-1 rounded text-[11px] text-amber-300 hover:bg-slate-800 cursor-pointer"
+                                  title="Generar viaje de vuelta invirtiendo inicio y final"
+                                >
+                                  + Vuelta
+                                </button>
+                              )}
+                              {editingGroupContext && row.id ? (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleUpdateDraftRow(row.localKey, { markedUnlink: !isUnlinkedRow })
+                                  }
+                                  className={`px-2.5 py-1 rounded text-[11px] font-semibold flex items-center gap-1 cursor-pointer ${
+                                    isUnlinkedRow
+                                      ? 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
+                                      : 'text-amber-300 hover:bg-slate-800'
+                                  }`}
+                                  title={
+                                    isUnlinkedRow
+                                      ? 'Mantener este viaje dentro del grupo'
+                                      : 'Desvincular este viaje de la carga al guardar'
+                                  }
+                                >
+                                  {isUnlinkedRow ? (
+                                    <>
+                                      <Link2 className="w-3 h-3" />
+                                      Restaurar al grupo
+                                    </>
+                                  ) : (
+                                    <>
+                                      <Unlink className="w-3 h-3" />
+                                      Desvincular
+                                    </>
+                                  )}
+                                </button>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveDraftRow(row.localKey)}
+                                  disabled={draftRows.length <= 1}
+                                  className="p-1 text-red-400 hover:bg-red-500/10 rounded disabled:opacity-30 cursor-pointer"
+                                  title="Quitar viaje"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
                             </div>
                           )}
                         </div>
@@ -2333,7 +2904,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                             <label className="block text-[11px] font-semibold text-slate-400 mb-1">Fecha *</label>
                             <input
                               type="date"
-                              required
+                              required={!isUnlinkedRow}
                               value={row.fecha}
                               onChange={e => handleUpdateDraftRow(row.localKey, { fecha: e.target.value })}
                               className="w-full bg-[#16191F] border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white font-mono"
@@ -2375,7 +2946,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                             <label className="block text-[11px] font-semibold text-slate-400 mb-1">Lugar de Inicio *</label>
                             <input
                               type="text"
-                              required
+                              required={!isUnlinkedRow}
                               list="rendimientos-lugares-list"
                               value={row.lugarInicio}
                               onChange={e => handleUpdateDraftRow(row.localKey, { lugarInicio: e.target.value })}
@@ -2388,7 +2959,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                             <label className="block text-[11px] font-semibold text-slate-400 mb-1">Lugar Final *</label>
                             <input
                               type="text"
-                              required
+                              required={!isUnlinkedRow}
                               list="rendimientos-lugares-list"
                               value={row.lugarFinal}
                               onChange={e => handleUpdateDraftRow(row.localKey, { lugarFinal: e.target.value })}
@@ -2418,7 +2989,7 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                               type="number"
                               step="0.1"
                               min="0.1"
-                              required
+                              required={!isUnlinkedRow}
                               value={row.kilometros}
                               onChange={e => handleUpdateDraftRow(row.localKey, { kilometros: e.target.value })}
                               placeholder="Ej: 48.5"
@@ -2535,13 +3106,25 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
               <div className="bg-[#0F1115] border border-slate-800 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-4 text-xs font-mono tabular-nums">
                 <div className="flex flex-wrap items-center gap-4">
                   <span>
-                    <span className="text-slate-400 font-sans">Viajes:</span>{' '}
-                    <b className="text-white">{draftRows.length}</b>
+                    <span className="text-slate-400 font-sans">Viajes en grupo:</span>{' '}
+                    <b className="text-white">{batchPreviewStats.activeCount}</b>
                   </span>
                   <span>
                     <span className="text-slate-400 font-sans">Kms lote:</span>{' '}
                     <b className="text-white">{batchPreviewStats.validKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km</b>
                   </span>
+                  {batchPreviewStats.liters > 0 && (
+                    <span>
+                      <span className="text-slate-400 font-sans">Carga:</span>{' '}
+                      <b className="text-slate-200">{batchPreviewStats.liters.toLocaleString('es-AR', { maximumFractionDigits: 1 })} L</b>
+                    </span>
+                  )}
+                  {batchPreviewStats.totalCost > 0 && (
+                    <span>
+                      <span className="text-slate-400 font-sans">Total ($):</span>{' '}
+                      <b className="text-emerald-400">{formatMoney(batchPreviewStats.totalCost)}</b>
+                    </span>
+                  )}
                   {batchPreviewStats.liters > 0 && (
                     <span>
                       <span className="text-slate-400 font-sans">Autonomía estimada:</span>{' '}
@@ -2583,7 +3166,9 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
                     ? 'Guardando en Supabase...'
                     : editingTrip
                       ? 'Guardar Cambios'
-                      : `Guardar ${draftRows.length} ${draftRows.length === 1 ? 'Viaje' : 'Viajes'}`}
+                      : editingGroupContext
+                        ? `Guardar Grupo (${batchPreviewStats.activeCount} ${batchPreviewStats.activeCount === 1 ? 'viaje' : 'viajes'})`
+                        : `Guardar ${draftRows.length} ${draftRows.length === 1 ? 'Viaje' : 'Viajes'}`}
                 </button>
               </div>
             </form>
@@ -2985,6 +3570,337 @@ export const RendimientosSection: React.FC<RendimientosSectionProps> = ({
           </div>
         </div>
       )}
+
+      {/* PORTAL: VISTA PREVIA DE IMPRESIÓN / PDF A4 */}
+      {printScope &&
+        printReportData &&
+        typeof document !== 'undefined' &&
+        createPortal(
+          <div
+            id="rendimientos-print-root"
+            className="fixed inset-0 z-[80] bg-slate-950/90 backdrop-blur-sm overflow-y-auto p-3 sm:p-6"
+          >
+            {/* Floating Action Toolbar (hidden when printing) */}
+            <div className="no-print max-w-[1060px] mx-auto mb-4 bg-[#16191F] border border-slate-800 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 shadow-xl">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <Printer className="w-4 h-4 text-[#F0C800] shrink-0" />
+                <div className="min-w-0">
+                  <div className="text-xs font-bold text-white truncate">
+                    Vista Previa de Impresión / PDF — {printReportData.title}
+                  </div>
+                  <div className="text-[11px] text-slate-400 truncate">
+                    Formato ejecutivo A4 listo para imprimir o descargar en PDF con totales en km, litros y plata ($).
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={handleDownloadPdfReport}
+                  className="px-3.5 py-2 rounded-lg text-xs font-bold bg-[#F0C800] hover:bg-amber-400 text-slate-950 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <FileText className="w-3.5 h-3.5" />
+                  Descargar PDF (A4)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="px-3.5 py-2 rounded-lg text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-white border border-slate-700 flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  Imprimir
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPrintScope(null)}
+                  className="px-3 py-2 rounded-lg text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 flex items-center gap-1 cursor-pointer"
+                >
+                  <X className="w-3.5 h-3.5" />
+                  Cerrar
+                </button>
+              </div>
+            </div>
+
+            {/* White A4 Paper Sheet */}
+            <div
+              id="rendimientos-print-sheet"
+              className="max-w-[1060px] mx-auto bg-white text-slate-900 rounded-xl shadow-2xl border border-slate-200 p-6 sm:p-8 space-y-6"
+            >
+              {/* Branded Report Header */}
+              <div className="border-b-2 border-slate-900 pb-4 flex flex-col sm:flex-row sm:items-end justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="flex items-center gap-2">
+                    <span className="inline-block w-2 h-5 bg-[#F0C800]" />
+                    <span className="text-[11px] font-bold tracking-wider uppercase text-slate-600">
+                      La Hormiga · Control Operativo de Flota
+                    </span>
+                  </div>
+                  <h1 className="text-xl font-bold text-slate-950 tracking-tight">
+                    {printReportData.title}
+                  </h1>
+                  <p className="text-xs text-slate-600 font-medium">
+                    {printReportData.subtitle}
+                  </p>
+                </div>
+
+                <div className="text-left sm:text-right text-[11px] text-slate-600 font-mono tabular-nums space-y-0.5 shrink-0">
+                  <div>
+                    Emisión: <b className="text-slate-900">{new Date().toLocaleDateString('es-AR')}</b>
+                  </div>
+                  <div>
+                    Grupos incluidos: <b className="text-slate-900">{printReportData.groups.length}</b> · Viajes:{' '}
+                    <b className="text-slate-900">{printReportData.totalTripsCount}</b>
+                  </div>
+                </div>
+              </div>
+
+              {/* 6-Card Executive KPI Bar */}
+              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Viajes</div>
+                  <div className="text-lg font-bold text-slate-950 font-mono tabular-nums mt-0.5">
+                    {printReportData.totalTripsCount}
+                  </div>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Kms Totales</div>
+                  <div className="text-lg font-bold text-slate-950 font-mono tabular-nums mt-0.5">
+                    {printReportData.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km
+                  </div>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Combustible</div>
+                  <div className="text-lg font-bold text-slate-950 font-mono tabular-nums mt-0.5">
+                    {printReportData.totalLiters > 0
+                      ? `${printReportData.totalLiters.toLocaleString('es-AR', { maximumFractionDigits: 1 })} L`
+                      : '—'}
+                  </div>
+                </div>
+                <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-emerald-700">
+                    Total en Plata
+                  </div>
+                  <div className="text-lg font-bold text-emerald-800 font-mono tabular-nums mt-0.5">
+                    {printReportData.totalMoney > 0 ? formatMoney(printReportData.totalMoney) : '—'}
+                  </div>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">Autonomía</div>
+                  <div className="text-lg font-bold text-slate-950 font-mono tabular-nums mt-0.5">
+                    {printReportData.autonomyKmL !== null ? `${printReportData.autonomyKmL.toFixed(2)} km/L` : '—'}
+                  </div>
+                </div>
+                <div className="bg-slate-50 border border-slate-200 rounded-lg p-3">
+                  <div className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                    {printReportData.costPerKm !== null ? 'Costo / km' : 'Demora Total'}
+                  </div>
+                  <div className="text-lg font-bold text-slate-950 font-mono tabular-nums mt-0.5">
+                    {printReportData.costPerKm !== null
+                      ? `$${printReportData.costPerKm.toFixed(0)}/km`
+                      : formatDurationMinutes(printReportData.totalMins)}
+                  </div>
+                </div>
+              </div>
+
+              {/* Per-Group Trip Tables */}
+              <div className="space-y-5">
+                {printReportData.groups.map(grp => {
+                  const isUnlinked = grp.groupKey === 'UNLINKED';
+                  const grpConsumedLiters = grp.trips.reduce(
+                    (sum, tr) => sum + (tripFuelConsumptionMap.get(tr.id)?.liters || 0),
+                    0
+                  );
+                  const grpConsumedCost = grp.trips.reduce(
+                    (sum, tr) => sum + (tripFuelConsumptionMap.get(tr.id)?.cost || 0),
+                    0
+                  );
+                  const displayCost = grpConsumedCost > 0 ? grpConsumedCost : grp.totalImporte;
+                  return (
+                    <div
+                      key={grp.groupKey}
+                      className="border border-slate-300 rounded-lg overflow-hidden break-inside-avoid-page"
+                    >
+                      <div className="bg-amber-50 border-b border-amber-200 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <div className="text-xs font-bold text-slate-950">
+                            {isUnlinked
+                              ? 'Viajes Pendientes de Agrupar'
+                              : `${grp.codigoEquipo}${grp.patente ? ` · ${grp.patente}` : ''}`}
+                          </div>
+                          <div className="text-[11px] text-slate-700 font-medium">{grp.label}</div>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono tabular-nums text-slate-800">
+                          <span>
+                            Viajes: <b>{grp.trips.length}</b>
+                          </span>
+                          <span>
+                            Kms: <b>{grp.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km</b>
+                          </span>
+                          {!isUnlinked && grp.liters > 0 && (
+                            <span>
+                              Comb: <b>{grp.liters.toLocaleString('es-AR', { maximumFractionDigits: 1 })} L</b>
+                            </span>
+                          )}
+                          {!isUnlinked && displayCost > 0 && (
+                            <span className="text-emerald-800 font-bold">
+                              Total: {formatMoney(displayCost)}
+                            </span>
+                          )}
+                          {grp.kmPerLiter !== null && (
+                            <span>
+                              Auton: <b>{grp.kmPerLiter.toFixed(2)} km/L</b>
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <table className="w-full text-left border-collapse text-[11px]">
+                        <thead>
+                          <tr className="bg-slate-800 text-white font-semibold">
+                            <th className="py-2 px-3">Fecha</th>
+                            <th className="py-2 px-3">Camión &amp; Chofer</th>
+                            <th className="py-2 px-3">Recorrido (Inicio → Final)</th>
+                            <th className="py-2 px-3">Tipo de Carga</th>
+                            <th className="py-2 px-3">Horario / Demora</th>
+                            <th className="py-2 px-3 text-right">Kms</th>
+                            <th className="py-2 px-3 text-right">Comb. (L)</th>
+                            <th className="py-2 px-3 text-right">%</th>
+                            <th className="py-2 px-3 text-right">Importe ($)</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-200">
+                          {grp.trips.map((t, idx) => {
+                            const dur = typeof t.duracionMinutos === 'number'
+                              ? t.duracionMinutos
+                              : computeDurationMinutes(t.horaSalida, t.horaLlegada);
+                            const cons = tripFuelConsumptionMap.get(t.id);
+                            return (
+                              <tr key={t.id} className={idx % 2 === 1 ? 'bg-slate-50/80' : 'bg-white'}>
+                                <td className="py-2 px-3 font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                                  {formatTableCellDate(t.fecha)}
+                                </td>
+                                <td className="py-2 px-3">
+                                  <div className="font-bold text-slate-900">{t.codigoEquipo}</div>
+                                  <div className="text-[10px] text-slate-600">
+                                    {t.choferNombre || 'Sin chofer'}
+                                    {t.patente ? ` · ${t.patente}` : ''}
+                                  </div>
+                                </td>
+                                <td className="py-2 px-3 text-slate-900 font-medium">
+                                  {t.lugarInicio} → {t.lugarFinal}
+                                  {t.observaciones && (
+                                    <div className="text-[10px] text-slate-500">{t.observaciones}</div>
+                                  )}
+                                </td>
+                                <td className="py-2 px-3 text-slate-800">
+                                  <div>{t.tipoCarga}</div>
+                                  {t.detalleCarga && (
+                                    <div className="text-[10px] text-slate-500">{t.detalleCarga}</div>
+                                  )}
+                                </td>
+                                <td className="py-2 px-3 font-mono tabular-nums text-slate-700 whitespace-nowrap">
+                                  {t.horaSalida || t.horaLlegada ? (
+                                    <div>
+                                      {t.horaSalida || '--:--'} → {t.horaLlegada || '--:--'}
+                                      {dur !== null && (
+                                        <span className="block text-[10px] text-emerald-700 font-semibold">
+                                          {formatDurationMinutes(dur)}
+                                        </span>
+                                      )}
+                                    </div>
+                                  ) : (
+                                    <span className="text-slate-400 font-sans">Sin horario</span>
+                                  )}
+                                </td>
+                                <td className="py-2 px-3 text-right font-mono tabular-nums font-bold text-slate-900 whitespace-nowrap">
+                                  {Number(t.kilometros || 0).toLocaleString('es-AR', { maximumFractionDigits: 1 })} km
+                                </td>
+                                <td className="py-2 px-3 text-right font-mono tabular-nums font-semibold text-slate-900 whitespace-nowrap">
+                                  {cons
+                                    ? `${cons.liters.toLocaleString('es-AR', {
+                                        minimumFractionDigits: 1,
+                                        maximumFractionDigits: 1,
+                                      })} L`
+                                    : '—'}
+                                </td>
+                                <td className="py-2 px-3 text-right font-mono tabular-nums text-slate-600 whitespace-nowrap">
+                                  {cons ? `${cons.sharePercent.toFixed(1)}%` : '—'}
+                                </td>
+                                <td className="py-2 px-3 text-right font-mono tabular-nums font-bold text-emerald-800 whitespace-nowrap">
+                                  {cons && cons.cost !== null ? formatMoney(cons.cost) : '—'}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                        <tfoot>
+                          <tr className="bg-slate-100 border-t border-slate-300 font-mono tabular-nums font-bold text-slate-950">
+                            <td colSpan={5} className="py-2 px-3 font-sans text-slate-800">
+                              Subtotal grupo ({grp.trips.length}{' '}
+                              {grp.trips.length === 1 ? 'viaje' : 'viajes'})
+                            </td>
+                            <td className="py-2 px-3 text-right whitespace-nowrap">
+                              {grp.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km
+                            </td>
+                            <td className="py-2 px-3 text-right whitespace-nowrap">
+                              {!isUnlinked && grpConsumedLiters > 0
+                                ? `${grpConsumedLiters.toLocaleString('es-AR', {
+                                    minimumFractionDigits: 1,
+                                    maximumFractionDigits: 1,
+                                  })} L`
+                                : '—'}
+                            </td>
+                            <td className="py-2 px-3 text-right text-slate-600 whitespace-nowrap">
+                              {!isUnlinked && grpConsumedLiters > 0 ? '100%' : '—'}
+                            </td>
+                            <td className="py-2 px-3 text-right text-emerald-800 whitespace-nowrap">
+                              {!isUnlinked && displayCost > 0 ? formatMoney(displayCost) : '—'}
+                            </td>
+                          </tr>
+                        </tfoot>
+                      </table>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Grand Total Bar (when multi-group report) */}
+              {printReportData.groups.length > 1 && (
+                <div className="bg-slate-900 text-white rounded-lg px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs font-mono tabular-nums">
+                  <div className="font-sans font-bold uppercase tracking-wide text-[#F0C800]">
+                    Total General del Reporte ({printReportData.totalTripsCount} viajes)
+                  </div>
+                  <div className="flex flex-wrap items-center gap-5">
+                    <span>
+                      Kms: <b>{printReportData.totalKms.toLocaleString('es-AR', { maximumFractionDigits: 1 })} km</b>
+                    </span>
+                    <span>
+                      Litros:{' '}
+                      <b>
+                        {printReportData.totalLiters > 0
+                          ? `${printReportData.totalLiters.toLocaleString('es-AR', { maximumFractionDigits: 1 })} L`
+                          : '—'}
+                      </b>
+                    </span>
+                    <span className="text-emerald-300 font-bold text-sm">
+                      Total en Plata:{' '}
+                      {printReportData.totalMoney > 0 ? formatMoney(printReportData.totalMoney) : '—'}
+                    </span>
+                  </div>
+                </div>
+              )}
+
+              {/* Control Signatures Footer */}
+              <div className="pt-4 border-t border-slate-200 grid grid-cols-3 gap-6 text-center text-[10px] text-slate-500">
+                <div className="pt-6 border-t border-slate-300 mt-4">Control Operativo de Flota</div>
+                <div className="pt-6 border-t border-slate-300 mt-4">Administración / Costos</div>
+                <div className="pt-6 border-t border-slate-300 mt-4">Conformidad Chofer / Supervisor</div>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   );
 };
