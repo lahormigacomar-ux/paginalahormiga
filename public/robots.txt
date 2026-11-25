@@ -1,0 +1,6 @@
+# Robots.txt for La Hormiga
+User-agent: *
+Allow: /
+Disallow: /api/
+
+Sitemap: https://lahormiga.com.ar/sitemap.xml

@@ -1,0 +1,11 @@
+{
+  "name": "La Hormiga - Alquileres, Maquinaria & Ferretería",
+  "description": "Sistema y catálogo comercial de La Hormiga en Jujuy: alquiler de maquinaria vial pesada con operario, herramientas menores, eventos y gastronomía, ferretería, movimientos de suelo y áridos.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
